@@ -28,6 +28,7 @@ class BasicTransformerBlock1D(nn.Module):
         dim_head: int,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         norm_eps: float = 1e-6,
+        apply_gated_attention: bool = False,
     ):
         """
         Initialize 1D transformer block.
@@ -38,6 +39,7 @@ class BasicTransformerBlock1D(nn.Module):
             dim_head: Dimension per head.
             rope_type: Type of RoPE.
             norm_eps: Epsilon for normalization.
+            apply_gated_attention: Enable per-head gating (V2).
         """
         super().__init__()
         self.norm_eps = norm_eps
@@ -50,6 +52,7 @@ class BasicTransformerBlock1D(nn.Module):
             context_dim=None,  # Self-attention
             rope_type=rope_type,
             norm_eps=norm_eps,
+            apply_gated_attention=apply_gated_attention,
         )
 
         # Feed-forward
@@ -117,6 +120,7 @@ class Embeddings1DConnector(nn.Module):
         num_learnable_registers: Optional[int] = 128,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         norm_eps: float = 1e-6,
+        apply_gated_attention: bool = False,
     ):
         """
         Initialize embeddings connector.
@@ -130,6 +134,7 @@ class Embeddings1DConnector(nn.Module):
             num_learnable_registers: Number of learnable register tokens.
             rope_type: Type of RoPE.
             norm_eps: Epsilon for normalization.
+            apply_gated_attention: Enable per-head gating (V2).
         """
         super().__init__()
 
@@ -148,6 +153,7 @@ class Embeddings1DConnector(nn.Module):
                 dim_head=attention_head_dim,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
+                apply_gated_attention=apply_gated_attention,
             )
             for _ in range(num_layers)
         ]

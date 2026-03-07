@@ -26,9 +26,12 @@ from LTX_2_MLX.types import SpatioTemporalScaleFactors
 from LTX_2_MLX.model.audio_vae import (
     AudioDecoder,
     Vocoder,
+    VocoderWithBWE,
     load_audio_decoder_weights,
     load_vocoder_weights,
+    load_vocoder_with_bwe_weights,
 )
+from LTX_2_MLX.model.audio_vae.vocoder import MelSTFT
 from LTX_2_MLX.model.video_vae import VideoDecoder, NormLayerType
 from LTX_2_MLX.components import DISTILLED_SIGMA_VALUES, VideoLatentPatchifier, get_sigma_schedule
 from LTX_2_MLX.components.guiders import LtxAPGGuider, LegacyStatefulAPGGuider, STGGuider
@@ -100,6 +103,8 @@ from LTX_2_MLX.model.text_encoder.encoder import (
     load_text_encoder_weights,
     create_av_text_encoder,
     load_av_text_encoder_weights,
+    create_av_text_encoder_v2,
+    load_av_text_encoder_v2_weights,
 )
 from LTX_2_MLX.model.upscaler import (
     SpatialUpscaler,
@@ -133,6 +138,121 @@ from LTX_2_MLX.model.video_vae.simple_encoder import (
     SimpleVideoEncoder,
     load_vae_encoder_weights,
 )
+
+def _read_checkpoint_config(checkpoint_path: str) -> dict:
+    """Read the JSON config from checkpoint metadata."""
+    import json
+    try:
+        from safetensors import safe_open
+        with safe_open(checkpoint_path, framework="pt") as f:
+            metadata = f.metadata() or {}
+        config_str = metadata.get("config", "{}")
+        return json.loads(config_str)
+    except Exception:
+        return {}
+
+
+def create_vocoder_for_checkpoint(
+    checkpoint_path: str,
+    compute_dtype: mx.Dtype = mx.float32,
+) -> tuple:
+    """Create the appropriate vocoder (plain or BWE) based on checkpoint config.
+
+    Returns:
+        Tuple of (vocoder_or_bwe, is_bwe).
+    """
+    config = _read_checkpoint_config(checkpoint_path)
+    vocoder_cfg = config.get("vocoder", {})
+
+    if "bwe" not in vocoder_cfg:
+        # Plain vocoder (LTX-2.0)
+        vocoder = Vocoder(compute_dtype=compute_dtype)
+        return vocoder, False
+
+    # BWE vocoder (LTX-2.3)
+    inner_cfg = vocoder_cfg.get("vocoder", {})
+    bwe_cfg = vocoder_cfg["bwe"]
+
+    # Create inner vocoder (AMP1 + snakebeta)
+    inner_vocoder = Vocoder(
+        resblock_kernel_sizes=inner_cfg.get("resblock_kernel_sizes", [3, 7, 11]),
+        upsample_rates=inner_cfg.get("upsample_rates", [6, 5, 2, 2, 2]),
+        upsample_kernel_sizes=inner_cfg.get("upsample_kernel_sizes", [16, 15, 8, 4, 4]),
+        resblock_dilation_sizes=inner_cfg.get("resblock_dilation_sizes", [[1, 3, 5], [1, 3, 5], [1, 3, 5]]),
+        upsample_initial_channel=inner_cfg.get("upsample_initial_channel", 1024),
+        resblock=inner_cfg.get("resblock", "AMP1"),
+        output_sample_rate=bwe_cfg.get("input_sampling_rate", 24000),
+        activation=inner_cfg.get("activation", "snakebeta"),
+        use_tanh_at_final=inner_cfg.get("use_tanh_at_final", True),
+        compute_dtype=compute_dtype,
+    )
+
+    # Create BWE generator
+    bwe_generator = Vocoder(
+        resblock_kernel_sizes=bwe_cfg.get("resblock_kernel_sizes", [3, 7, 11]),
+        upsample_rates=bwe_cfg.get("upsample_rates", [2]),
+        upsample_kernel_sizes=bwe_cfg.get("upsample_kernel_sizes", [4]),
+        resblock_dilation_sizes=bwe_cfg.get("resblock_dilation_sizes", [[1, 3, 5], [1, 3, 5], [1, 3, 5]]),
+        upsample_initial_channel=bwe_cfg.get("upsample_initial_channel", 256),
+        resblock=bwe_cfg.get("resblock", "AMP1"),
+        output_sample_rate=bwe_cfg.get("output_sampling_rate", 48000),
+        activation=bwe_cfg.get("activation", "snakebeta"),
+        apply_final_activation=False,
+        use_tanh_at_final=bwe_cfg.get("use_tanh_at_final", True),
+        compute_dtype=compute_dtype,
+    )
+
+    # Create MelSTFT
+    mel_stft = MelSTFT(
+        filter_length=bwe_cfg.get("n_fft", 2048),
+        hop_length=bwe_cfg.get("hop_length", 240),
+        win_length=bwe_cfg.get("n_fft", 2048),
+        n_mel_channels=bwe_cfg.get("num_mels", 128),
+    )
+
+    vocoder_with_bwe = VocoderWithBWE(
+        vocoder=inner_vocoder,
+        bwe_generator=bwe_generator,
+        mel_stft=mel_stft,
+        input_sampling_rate=bwe_cfg.get("input_sampling_rate", 24000),
+        output_sampling_rate=bwe_cfg.get("output_sampling_rate", 48000),
+        hop_length=bwe_cfg.get("hop_length", 240),
+    )
+    return vocoder_with_bwe, True
+
+
+def detect_model_version(checkpoint_path: str) -> str:
+    """Detect model version from safetensors checkpoint metadata.
+
+    Returns version string (e.g. "2.3.0") or empty string if unknown.
+    """
+    try:
+        from safetensors import safe_open
+        with safe_open(checkpoint_path, framework="pt") as f:
+            metadata = f.metadata() or {}
+        return metadata.get("model_version", "")
+    except Exception:
+        return ""
+
+
+def is_v2_model(checkpoint_path: str) -> bool:
+    """Check if checkpoint is an LTX-2.3 (V2) model."""
+    version = detect_model_version(checkpoint_path)
+    return version.startswith("2.3")
+
+
+def get_vae_config(checkpoint_path: str) -> dict:
+    """Read VAE config from checkpoint metadata."""
+    try:
+        import json
+        from safetensors import safe_open
+        with safe_open(checkpoint_path, framework="pt") as f:
+            metadata = f.metadata() or {}
+        config = json.loads(metadata.get("config", "{}"))
+        return config.get("vae", {})
+    except Exception:
+        return {}
+
 
 # Try to import tqdm for progress bars
 try:
@@ -455,8 +575,13 @@ def encode_with_av_gemma(
     load_gemma3_weights(gemma, gemma_path, use_fp16=False)
 
     print(f"  Loading AV text encoder projection...")
-    text_encoder = create_av_text_encoder()
-    load_av_text_encoder_weights(text_encoder, ltx_weights_path)
+    if is_v2_model(ltx_weights_path):
+        print(f"  Detected LTX-2.3 (V2) model — using V2 text encoder")
+        text_encoder = create_av_text_encoder_v2()
+        load_av_text_encoder_v2_weights(text_encoder, ltx_weights_path)
+    else:
+        text_encoder = create_av_text_encoder()
+        load_av_text_encoder_weights(text_encoder, ltx_weights_path)
 
     # Tokenize prompt directly (skip chat template - it dilutes the signal)
     print(f"  Tokenizing prompt...")
@@ -718,12 +843,23 @@ def load_av_transformer(
     compute_dtype: mx.Dtype = mx.float32,
     use_fp8: bool = False,
     low_memory: bool = False,
+    caption_channels: int | None = 3840,
+    cross_attention_adaln: bool = False,
+    apply_gated_attention: bool = False,
 ) -> LTXAVModel:
-    """Load AudioVideo transformer with weights."""
+    """Load AudioVideo transformer with weights.
+
+    Args:
+        caption_channels: Caption embedding dim (3840 for V1/2.0, None for V2/2.3
+            where the feature extractor projects directly to transformer dims).
+        cross_attention_adaln: V2 cross-attention AdaLN (prompt_adaln_single).
+        apply_gated_attention: V2 per-head gating in attention.
+    """
     dtype_name = "FP16" if compute_dtype == mx.float16 else "FP32"
     fp8_str = " (FP8 dequantized)" if use_fp8 else ""
     mem_str = " (low memory)" if low_memory else ""
-    print(f"Loading AudioVideo transformer ({dtype_name}{fp8_str}{mem_str})...")
+    v2_str = " (V2)" if cross_attention_adaln else ""
+    print(f"Loading AudioVideo transformer ({dtype_name}{fp8_str}{mem_str}{v2_str})...")
 
     model = LTXAVModel(
         model_type=LTXModelType.AudioVideo,
@@ -733,10 +869,12 @@ def load_av_transformer(
         out_channels=128,
         num_layers=num_layers,
         cross_attention_dim=4096,
-        caption_channels=3840,
+        caption_channels=caption_channels,
         positional_embedding_theta=10000.0,
         compute_dtype=compute_dtype,
         low_memory=low_memory,
+        cross_attention_adaln=cross_attention_adaln,
+        apply_gated_attention=apply_gated_attention,
     )
 
     # Load weights (including audio components)
@@ -923,14 +1061,18 @@ def generate_video(
         print(f"  Using enhanced prompt for generation")
 
     # Get text encoding
-    # Initialize audio encodings (used only when generate_audio=True)
+    # Initialize audio encodings (used only when generate_audio=True or V2.3)
     text_audio_encoding = None
     null_audio_encoding = None
+
+    # V2.3 always uses the AV text encoder (dual video/audio embeddings)
+    v2 = weights_path and is_v2_model(weights_path)
+    use_av_encoder = generate_audio or v2
 
     print("\n[1/5] Encoding prompt...")
     if embedding_path:
         text_encoding, text_mask = load_text_embedding(embedding_path)
-        if generate_audio:
+        if use_av_encoder:
             print("  WARNING: Pre-computed embeddings don't include audio encoding. Audio quality may be degraded.")
             text_audio_encoding = text_encoding  # Fallback: use video encoding for audio
     elif use_gemma:
@@ -942,8 +1084,9 @@ def generate_video(
             print(f"\n  Or use --no-gemma flag to use dummy embeddings for testing")
             return
 
-        if generate_audio:
+        if use_av_encoder:
             # Use AudioVideo Gemma encoder (returns both video and audio encodings)
+            # V2.3 always needs this path even without audio generation
             text_encoding, text_audio_encoding, text_mask = encode_with_av_gemma(
                 prompt=prompt,
                 gemma_path=gemma_path,
@@ -954,7 +1097,7 @@ def generate_video(
                 return
             print(f"  Encoded with Gemma 3 (AudioVideo)")
         else:
-            # Use video-only Gemma encoding
+            # Use video-only Gemma encoding (V1/V2.0 only)
             text_encoding, text_mask = encode_with_gemma(
                 prompt=prompt,
                 gemma_path=gemma_path,
@@ -975,7 +1118,7 @@ def generate_video(
     # For proper CFG, encode empty string through text encoder (not zeros)
     if use_gemma and gemma_path and os.path.exists(gemma_path):
         print("  Encoding empty prompt for CFG unconditional...")
-        if generate_audio:
+        if use_av_encoder:
             # Use AudioVideo encoder for null encoding too
             null_encoding, null_audio_encoding, null_mask = encode_with_av_gemma(
                 prompt="",  # Empty string for unconditional
@@ -1013,14 +1156,21 @@ def generate_video(
             max_tokens=text_encoding.shape[1],
             embed_dim=text_encoding.shape[2],
         )
-        if generate_audio:
+        if use_av_encoder:
             null_audio_encoding = null_encoding  # Fallback
 
     # Load model
-    if generate_audio:
+    # V2.3 always uses the AV transformer (dual video/audio cross-attention)
+    if use_av_encoder:
         print("\n[2/5] Loading AudioVideo transformer...")
         if not use_placeholder and weights_path:
-            model = load_av_transformer(weights_path, num_layers=48, compute_dtype=compute_dtype, use_fp8=use_fp8, low_memory=low_memory)
+            model = load_av_transformer(
+                weights_path, num_layers=48, compute_dtype=compute_dtype,
+                use_fp8=use_fp8, low_memory=low_memory,
+                caption_channels=None if v2 else 3840,
+                cross_attention_adaln=v2,
+                apply_gated_attention=v2,
+            )
         else:
             model = None
             print("  Skipping model load (placeholder mode)")
@@ -1107,7 +1257,19 @@ def generate_video(
     vae_decoder = None
     if not skip_vae:
         print(f"\n[3/5] Loading VAE decoder...")
-        vae_decoder = SimpleVideoDecoder(compute_dtype=compute_dtype)
+        # Read VAE config from checkpoint to build correct architecture
+        vae_config = get_vae_config(weights_path) if weights_path else {}
+        decoder_blocks = vae_config.get("decoder_blocks", None)
+        base_channels = vae_config.get("decoder_base_channels", 128)
+        timestep_cond = vae_config.get("timestep_conditioning", True)
+        if decoder_blocks:
+            print(f"  VAE config: {len(decoder_blocks)} blocks, base_ch={base_channels}, timestep={timestep_cond}")
+        vae_decoder = SimpleVideoDecoder(
+            decoder_blocks=decoder_blocks,
+            base_channels=base_channels,
+            timestep_conditioning=timestep_cond,
+            compute_dtype=compute_dtype,
+        )
         if weights_path and not use_placeholder:
              load_vae_decoder_weights(vae_decoder, weights_path)
         elif use_placeholder:
@@ -1181,6 +1343,7 @@ def generate_video(
         # Load audio components if audio generation is enabled
         audio_decoder = None
         vocoder = None
+        audio_sample_rate = 24000
         if generate_audio:
             print("  Loading Audio VAE decoder...")
             audio_decoder = AudioDecoder(compute_dtype=compute_dtype)
@@ -1188,9 +1351,16 @@ def generate_video(
                 load_audio_decoder_weights(audio_decoder, weights_path)
 
             print("  Loading Vocoder...")
-            vocoder = Vocoder(compute_dtype=compute_dtype)
             if weights_path:
-                load_vocoder_weights(vocoder, weights_path)
+                vocoder, is_bwe = create_vocoder_for_checkpoint(weights_path, compute_dtype)
+                if is_bwe:
+                    print("  Detected BWE vocoder (LTX-2.3)")
+                    load_vocoder_with_bwe_weights(vocoder, weights_path)
+                else:
+                    load_vocoder_weights(vocoder, weights_path)
+            else:
+                vocoder = Vocoder(compute_dtype=compute_dtype)
+            audio_sample_rate = vocoder.output_sample_rate if vocoder else 24000
 
         # Create two-stage pipeline
         print("\n[4/5] Creating two-stage pipeline...")
@@ -1259,7 +1429,7 @@ def generate_video(
         # Save video
         print(f"\nSaving video to {output_path}...")
         if audio_waveform is not None:
-            save_video_with_audio(frames, audio_waveform, output_path, fps=output_fps, speed=output_speed)
+            save_video_with_audio(frames, audio_waveform, output_path, fps=output_fps, speed=output_speed, audio_sample_rate=audio_sample_rate)
         else:
             save_video(frames, output_path, fps=output_fps, speed=output_speed)
         print(f"Done! Video saved to {output_path}")
@@ -1474,17 +1644,18 @@ def generate_video(
 
     # === AUDIO-VIDEO PIPELINE ===
     # Use OneStagePipeline for joint audio-video generation
-    if generate_audio:
+    # V2.3 always uses this path (AV transformer) even without audio generation
+    if use_av_encoder:
         print("\n=== Using Audio-Video Pipeline ===")
 
         if model is None:
             if use_placeholder:
-                print("  Audio generation requires model - cannot use placeholder mode")
+                print("  AV pipeline requires model - cannot use placeholder mode")
                 return
-            raise ValueError("Audio generation requires a loaded AudioVideo model")
+            raise ValueError("AV pipeline requires a loaded AudioVideo model")
 
         if vae_decoder is None and not use_placeholder:
-            raise ValueError("Audio generation requires VAE decoder")
+            raise ValueError("AV pipeline requires VAE decoder")
 
         # Load VAE encoder (needed for image conditioning)
         print("[3.5/5] Loading VAE encoder...")
@@ -1494,16 +1665,27 @@ def generate_video(
         else:
             print("  Skipping weights load (placeholder)")
 
-        # Load audio components
-        print("  Loading Audio VAE decoder...")
-        audio_decoder = AudioDecoder(compute_dtype=compute_dtype)
-        if weights_path:
-            load_audio_decoder_weights(audio_decoder, weights_path)
+        # Load audio components only when audio generation is requested
+        audio_decoder = None
+        vocoder = None
+        audio_sample_rate = 24000
+        if generate_audio:
+            print("  Loading Audio VAE decoder...")
+            audio_decoder = AudioDecoder(compute_dtype=compute_dtype)
+            if weights_path:
+                load_audio_decoder_weights(audio_decoder, weights_path)
 
-        print("  Loading Vocoder...")
-        vocoder = Vocoder(compute_dtype=compute_dtype)
-        if weights_path:
-            load_vocoder_weights(vocoder, weights_path)
+            print("  Loading Vocoder...")
+            if weights_path:
+                vocoder, is_bwe = create_vocoder_for_checkpoint(weights_path, compute_dtype)
+                if is_bwe:
+                    print("  Detected BWE vocoder (LTX-2.3)")
+                    load_vocoder_with_bwe_weights(vocoder, weights_path)
+                else:
+                    load_vocoder_weights(vocoder, weights_path)
+            else:
+                vocoder = Vocoder(compute_dtype=compute_dtype)
+            audio_sample_rate = vocoder.output_sample_rate if vocoder else 24000
 
         # Create one-stage pipeline with audio support
         print("\n[4/5] Creating audio-video pipeline...")
@@ -1526,7 +1708,7 @@ def generate_video(
             num_inference_steps=num_steps,
             cfg_scale=cfg_scale,
             dtype=compute_dtype,
-            audio_enabled=True,
+            audio_enabled=generate_audio,
         )
 
         # Create image conditionings if provided
@@ -1567,7 +1749,7 @@ def generate_video(
         # Save video with audio
         print(f"\nSaving video to {output_path}...")
         if audio_waveform is not None:
-            save_video_with_audio(frames, audio_waveform, output_path, fps=output_fps, speed=output_speed)
+            save_video_with_audio(frames, audio_waveform, output_path, fps=output_fps, speed=output_speed, audio_sample_rate=audio_sample_rate)
         else:
             save_video(frames, output_path, fps=output_fps, speed=output_speed)
         print(f"Done! Video saved to {output_path}")

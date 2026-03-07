@@ -159,6 +159,7 @@ class Attention(nn.Module):
         dim_head: int = 64,
         norm_eps: float = 1e-6,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,  # PyTorch default
+        apply_gated_attention: bool = False,
     ):
         """
         Initialize attention module.
@@ -170,6 +171,7 @@ class Attention(nn.Module):
             dim_head: Dimension per head.
             norm_eps: Epsilon for RMSNorm.
             rope_type: Type of RoPE to use.
+            apply_gated_attention: Per-head gating (V2).
         """
         super().__init__()
 
@@ -188,6 +190,12 @@ class Attention(nn.Module):
         self.to_q = nn.Linear(query_dim, inner_dim, bias=True)
         self.to_k = nn.Linear(context_dim, inner_dim, bias=True)
         self.to_v = nn.Linear(context_dim, inner_dim, bias=True)
+
+        # Optional per-head gating (V2)
+        if apply_gated_attention:
+            self.to_gate_logits = nn.Linear(query_dim, heads, bias=True)
+        else:
+            self.to_gate_logits = None
 
         # Output projection
         self.to_out = nn.Linear(inner_dim, query_dim, bias=True)
@@ -230,6 +238,16 @@ class Attention(nn.Module):
 
         # Use compiled attention core for better performance
         out = _attention_core(q, k, v, self.heads, self.dim_head, mask)
+
+        # Apply per-head gating if enabled (V2)
+        if self.to_gate_logits is not None:
+            gate_logits = self.to_gate_logits(x)  # (B, T, H)
+            b, t, _ = out.shape
+            out = out.reshape(b, t, self.heads, self.dim_head)
+            # 2 * sigmoid so zero-init gives identity (2 * 0.5 = 1.0)
+            gates = 2.0 * mx.sigmoid(gate_logits)
+            out = out * gates[:, :, :, None]  # (B, T, H, D) * (B, T, H, 1)
+            out = out.reshape(b, t, self.heads * self.dim_head)
 
         # Output projection
         return self.to_out(out)

@@ -7,7 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .connector import Embeddings1DConnector
-from .feature_extractor import GemmaFeaturesExtractorProjLinear
+from .feature_extractor import GemmaFeaturesExtractorProjLinear, GemmaFeaturesExtractorV2
 
 
 @dataclass
@@ -258,7 +258,7 @@ class AudioVideoGemmaTextEncoderModel(nn.Module):
 
     def __init__(
         self,
-        feature_extractor: Optional[GemmaFeaturesExtractorProjLinear] = None,
+        feature_extractor: Optional[nn.Module] = None,
         embeddings_connector: Optional[Embeddings1DConnector] = None,
         audio_embeddings_connector: Optional[Embeddings1DConnector] = None,
     ):
@@ -266,7 +266,7 @@ class AudioVideoGemmaTextEncoderModel(nn.Module):
         Initialize audio+video text encoder.
 
         Args:
-            feature_extractor: Gemma feature extractor for hidden state projection.
+            feature_extractor: Gemma feature extractor (V1 or V2).
             embeddings_connector: 1D connector for video sequence refinement.
             audio_embeddings_connector: 1D connector for audio sequence refinement.
         """
@@ -313,17 +313,29 @@ class AudioVideoGemmaTextEncoderModel(nn.Module):
             AudioVideoGemmaEncoderOutput with separate video and audio encodings.
         """
         # Extract features from hidden states
-        encoded_input = self.feature_extractor.extract_from_hidden_states(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            padding_side=padding_side,
-        )
+        # V2 returns (video_features, audio_features); V1 returns a single tensor
+        is_v2 = isinstance(self.feature_extractor, GemmaFeaturesExtractorV2)
+
+        if is_v2:
+            video_input, audio_input = self.feature_extractor.extract_from_hidden_states(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                padding_side=padding_side,
+            )
+        else:
+            encoded_input = self.feature_extractor.extract_from_hidden_states(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                padding_side=padding_side,
+            )
+            video_input = encoded_input
+            audio_input = encoded_input
 
         # Convert mask to additive format
-        connector_mask = self._convert_to_additive_mask(attention_mask, encoded_input.dtype)
+        connector_mask = self._convert_to_additive_mask(attention_mask, video_input.dtype)
 
         # Process through video connector
-        video_encoded, output_mask = self.embeddings_connector(encoded_input, connector_mask)
+        video_encoded, output_mask = self.embeddings_connector(video_input, connector_mask)
 
         # Convert mask back to binary
         binary_mask = (output_mask.squeeze(1).squeeze(1) >= -0.5).astype(mx.int32)
@@ -332,9 +344,8 @@ class AudioVideoGemmaTextEncoderModel(nn.Module):
         # Apply mask to video encoding
         video_encoded = video_encoded * binary_mask_expanded
 
-        # Process through audio connector (uses same input features)
-        audio_encoded, _ = self.audio_embeddings_connector(encoded_input, connector_mask)
-        # Note: audio uses same mask
+        # Process through audio connector
+        audio_encoded, _ = self.audio_embeddings_connector(audio_input, connector_mask)
 
         return AudioVideoGemmaEncoderOutput(
             video_encoding=video_encoded,
@@ -595,8 +606,9 @@ def _load_connector_weights(
         connector.learnable_registers = mx.array(tensor.numpy())
         loaded_count += 1
 
-    # Transformer blocks
-    for block_idx in range(2):
+    # Transformer blocks (V1 has 2, V2 has 8)
+    num_blocks = len(connector.transformer_1d_blocks)
+    for block_idx in range(num_blocks):
         block = connector.transformer_1d_blocks[block_idx]
         block_prefix = f"{prefix}transformer_1d_blocks.{block_idx}."
 
@@ -612,6 +624,8 @@ def _load_connector_weights(
             "attn1.to_out.0.bias": ("attn1", "to_out", "bias"),
             "attn1.q_norm.weight": ("attn1", "q_norm", "weight"),
             "attn1.k_norm.weight": ("attn1", "k_norm", "weight"),
+            "attn1.to_gate_logits.weight": ("attn1", "to_gate_logits", "weight"),
+            "attn1.to_gate_logits.bias": ("attn1", "to_gate_logits", "bias"),
         }
 
         for pt_suffix, (attn_name, layer_name, param_name) in attn_mapping.items():
@@ -696,3 +710,91 @@ def load_av_text_encoder_weights(
         loaded_count = _load_connector_weights(f, encoder.audio_embeddings_connector, audio_prefix, loaded_count)
 
     print(f"  Loaded {loaded_count} AV text encoder weight tensors")
+
+
+def create_av_text_encoder_v2(
+    hidden_dim: int = 3840,
+    num_gemma_layers: int = 49,
+    video_inner_dim: int = 4096,
+    audio_inner_dim: int = 2048,
+    video_connector_heads: int = 32,
+    video_connector_head_dim: int = 128,
+    audio_connector_heads: int = 32,
+    audio_connector_head_dim: int = 64,
+    connector_layers: int = 8,
+    num_registers: int = 128,
+) -> AudioVideoGemmaTextEncoderModel:
+    """Create a V2 audio+video text encoder for LTX-2.3.
+
+    V2 uses per-token RMS normalization and dual aggregate embeddings
+    that project directly to transformer-native dimensions (4096 video, 2048 audio).
+    """
+    feature_extractor = GemmaFeaturesExtractorV2(
+        hidden_dim=hidden_dim,
+        num_layers=num_gemma_layers,
+        video_inner_dim=video_inner_dim,
+        audio_inner_dim=audio_inner_dim,
+    )
+
+    embeddings_connector = Embeddings1DConnector(
+        attention_head_dim=video_connector_head_dim,
+        num_attention_heads=video_connector_heads,
+        num_layers=connector_layers,
+        num_learnable_registers=num_registers,
+        apply_gated_attention=True,
+    )
+
+    audio_embeddings_connector = Embeddings1DConnector(
+        attention_head_dim=audio_connector_head_dim,
+        num_attention_heads=audio_connector_heads,
+        num_layers=connector_layers,
+        num_learnable_registers=num_registers,
+        apply_gated_attention=True,
+    )
+
+    return AudioVideoGemmaTextEncoderModel(
+        feature_extractor=feature_extractor,
+        embeddings_connector=embeddings_connector,
+        audio_embeddings_connector=audio_embeddings_connector,
+    )
+
+
+def load_av_text_encoder_v2_weights(
+    encoder: AudioVideoGemmaTextEncoderModel,
+    weights_path: str,
+) -> None:
+    """Load V2 audio+video text encoder weights from safetensors file.
+
+    V2 has dual aggregate embeds (with bias) instead of a single one.
+    """
+    from safetensors import safe_open
+    import torch
+
+    print(f"Loading AV text encoder V2 weights from {weights_path}...")
+
+    loaded_count = 0
+
+    with safe_open(weights_path, framework="pt") as f:
+        keys = list(f.keys())
+
+        # Load V2 feature extractor: video_aggregate_embed and audio_aggregate_embed
+        for name in ["video_aggregate_embed", "audio_aggregate_embed"]:
+            for param in ["weight", "bias"]:
+                fe_key = f"text_embedding_projection.{name}.{param}"
+                if fe_key in keys:
+                    tensor = f.get_tensor(fe_key)
+                    if tensor.dtype == torch.bfloat16:
+                        tensor = tensor.to(torch.float32)
+                    layer = getattr(encoder.feature_extractor, name)
+                    setattr(layer, param, mx.array(tensor.numpy()))
+                    loaded_count += 1
+
+        # Load video embeddings connector
+        video_prefix = "model.diffusion_model.video_embeddings_connector."
+        loaded_count = _load_connector_weights(f, encoder.embeddings_connector, video_prefix, loaded_count)
+
+        # Load audio embeddings connector
+        audio_prefix = "model.diffusion_model.audio_embeddings_connector."
+        loaded_count = _load_connector_weights(f, encoder.audio_embeddings_connector, audio_prefix, loaded_count)
+
+    print(f"  Loaded {loaded_count} AV text encoder V2 weight tensors")

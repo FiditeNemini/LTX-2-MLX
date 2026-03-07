@@ -1,6 +1,6 @@
 """Simplified Video VAE Decoder for inference with PyTorch weight loading."""
 
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -242,41 +242,39 @@ class ResBlock3d(nn.Module):
 
 class DepthToSpaceUpsample3d(nn.Module):
     """
-    Upsample using depth-to-space (pixel shuffle) in 3D with residual connection.
+    Upsample using depth-to-space (pixel shuffle) in 3D with optional residual connection.
 
-    This block halves the channel count while upsampling spatially/temporally.
-    For factor (2,2,2): in_channels -> in_channels/2, with 2x upsampling in T,H,W.
-
-    Matches LTX2VideoUpsampler3d from diffusers:
-    - Conv expands channels by factor/upscale_factor
-    - Reshape/permute/flatten performs depth-to-space
-    - Trims first (factor[0]-1) frames for causal consistency
-    - Residual path: input is upsampled via d2s and repeated channels, then added
+    Supports variable stride factors and channel reduction:
+    - stride (2,2,2): 2x upsample in T, H, W (compress_all)
+    - stride (2,1,1): 2x upsample in T only (compress_time)
+    - stride (1,2,2): 2x upsample in H, W only (compress_space)
+    - out_channels_reduction_factor: channel reduction (1=keep, 2=halve)
     """
 
-    def __init__(self, in_channels: int, factor: Tuple[int, int, int] = (2, 2, 2), residual: bool = False):
+    def __init__(
+        self,
+        in_channels: int,
+        stride: Tuple[int, int, int] = (2, 2, 2),
+        residual: bool = False,
+        out_channels_reduction_factor: int = 2,
+    ):
         super().__init__()
-        self.factor = factor
+        self.stride = stride
         self.residual = residual
-        ft, fh, fw = factor
-        factor_product = ft * fh * fw
+        self.out_channels_reduction_factor = out_channels_reduction_factor
+        stride_product = math.prod(stride)
 
-        # Output channels after depth-to-space is half of input
-        # upscale_factor = 2 in LTX
-        self.upscale_factor = 2
-        self.out_channels = in_channels // self.upscale_factor
-        # Conv outputs enough channels for d2s to produce out_channels
-        conv_out_channels = self.out_channels * factor_product
+        # Final output channels after d2s = in_channels / reduction_factor
+        self.final_out_channels = in_channels // out_channels_reduction_factor
+
+        # Conv output channels (before d2s rearrange)
+        conv_out_channels = stride_product * in_channels // out_channels_reduction_factor
         self.conv = Conv3dSimple(in_channels, conv_out_channels)
-
-        # Number of channel repeats for residual path
-        # repeats = factor_product // upscale_factor = 8 // 2 = 4
-        self.channel_repeats = factor_product // self.upscale_factor
 
     def _depth_to_space(self, x: mx.array, c_out: int) -> mx.array:
         """Apply depth-to-space rearrangement."""
         b, c, t, h, w = x.shape
-        ft, fh, fw = self.factor
+        ft, fh, fw = self.stride
 
         # Reshape to separate stride factors
         x = x.reshape(b, c_out, ft, fh, fw, t, h, w)
@@ -287,53 +285,28 @@ class DepthToSpaceUpsample3d(nn.Module):
         return x
 
     def __call__(self, x: mx.array, causal: bool = True) -> mx.array:
-        """Upsample via conv then depth-to-space with optional residual.
+        """Upsample via conv then depth-to-space with optional residual."""
+        ft, fh, fw = self.stride
+        stride_product = ft * fh * fw
 
-        Note: Frame trimming (removing first frame after d2s) happens unconditionally
-        when temporal factor > 1, matching PyTorch behavior. The causal parameter
-        only affects the conv layer padding style.
-        """
-        ft, fh, fw = self.factor
-        factor_product = ft * fh * fw
-
-        # Residual path: depth-to-space on input, then repeat channels
-        # PyTorch does:
-        #   1. pixel_shuffle(x) - this rearranges (B, in_ch, T, H, W) to (B, in_ch/8, T*2, H*2, W*2)
-        #   2. repeat channels by (factor_product // upscale_factor) = 8 // 2 = 4
-        # Example for in_channels=1024:
-        #   - After d2s: 1024/8 = 128 channels
-        #   - After repeat 4x: 128*4 = 512 = out_channels
+        # Residual path
         if self.residual:
             b, c_in, t, h, w = x.shape
-            # c_in / factor_product = number of output channels from d2s
-            c_d2s = c_in // factor_product  # e.g., 1024 // 8 = 128
-
-            # Apply depth-to-space to input
+            c_d2s = c_in // stride_product
             residual = self._depth_to_space(x, c_d2s)
-
-            # Trim first frame UNCONDITIONALLY when temporal factor > 1
-            # This matches PyTorch: x_in = x_in[:, :, 1:, :, :] when stride[0] == 2
             if ft > 1:
                 residual = residual[:, :, 1:]
-
-            # Tile channels to match out_channels (PyTorch uses tensor.repeat which tiles)
-            # num_repeat = factor_product // upscale_factor = 8 // 2 = 4
-            # PyTorch repeat(1,4,1,1,1) tiles: [C0,C1,...,Cn, C0,C1,...,Cn, ...]
-            # mx.repeat interleaves: [C0,C0,C0,C0, C1,C1,C1,C1, ...]
-            # We need tile behavior, so use mx.tile
-            num_repeat = factor_product // self.upscale_factor
+            num_repeat = stride_product // self.out_channels_reduction_factor
             residual = mx.tile(residual, (1, num_repeat, 1, 1, 1))
 
         # Main path: conv then d2s
         x = self.conv(x, causal=causal)
-        x = self._depth_to_space(x, self.out_channels)
+        x = self._depth_to_space(x, self.final_out_channels)
 
-        # Trim first frame UNCONDITIONALLY when temporal factor > 1
-        # This matches PyTorch: x = x[:, :, 1:, :, :] when stride[0] == 2
+        # Trim first frame when temporal stride > 1
         if ft > 1:
             x = x[:, :, 1:]
 
-        # Add residual
         if self.residual:
             x = x + residual
 
@@ -347,31 +320,16 @@ class ResBlockGroup(nn.Module):
         super().__init__()
         self.channels = channels
         self.res_blocks = [ResBlock3d(channels) for _ in range(num_blocks)]
-        # Time embedder: outputs 4*channels for each res block (scale/shift for 2 norms)
-        # But in LTX, the time_embedder outputs 4*channels and broadcasts to all blocks
         self.time_embedder = None  # Will be set during weight loading if available
 
     def __call__(
         self, x: mx.array, causal: bool = True, timestep: Optional[mx.array] = None
     ) -> mx.array:
-        """
-        Apply all res blocks sequentially.
-
-        Args:
-            x: Input tensor (B, C, T, H, W)
-            causal: Whether to use causal padding
-            timestep: Optional scaled timestep (B,) for conditioning
-
-        Returns:
-            Output tensor (B, C, T, H, W)
-        """
         # Compute time embedding if timestep provided and embedder exists
         time_emb = None
         if timestep is not None and self.time_embedder is not None:
-            # Get sinusoidal embedding
-            t_emb = get_timestep_embedding(timestep, 256)  # (B, 256)
-            # Project through time embedder
-            time_emb = self.time_embedder(t_emb)  # (B, 4*channels)
+            t_emb = get_timestep_embedding(timestep, 256)
+            time_emb = self.time_embedder(t_emb)
 
         for block in self.res_blocks:
             x = block(x, causal=causal, time_emb=time_emb)
@@ -384,63 +342,106 @@ def _pixel_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
     return x * mx.rsqrt(variance + eps)
 
 
+# Stride mapping for decoder block types
+_STRIDE_MAP = {
+    "compress_all": (2, 2, 2),
+    "compress_time": (2, 1, 1),
+    "compress_space": (1, 2, 2),
+}
+
+# Default V2.0 decoder blocks (used when no config is provided)
+_DEFAULT_DECODER_BLOCKS = [
+    ["res_x", {"num_layers": 5}],
+    ["compress_all", {"multiplier": 2, "residual": True}],
+    ["res_x", {"num_layers": 5}],
+    ["compress_all", {"multiplier": 2, "residual": True}],
+    ["res_x", {"num_layers": 5}],
+    ["compress_all", {"multiplier": 2, "residual": True}],
+    ["res_x", {"num_layers": 5}],
+]
+
+
 class SimpleVideoDecoder(nn.Module):
     """
-    Simplified VAE decoder that matches PyTorch weight structure.
+    Config-driven VAE decoder that supports both V2.0 and V2.3 architectures.
 
-    Architecture:
-    - conv_in: 128 -> 1024
-    - up_blocks.0: 5 res blocks (1024 ch) + timestep conditioning
-    - up_blocks.1: depth-to-space upsample (1024 -> 512 ch, 2x2x2 spatial/temporal)
-    - up_blocks.2: 5 res blocks (512 ch) + timestep conditioning
-    - up_blocks.3: depth-to-space upsample (512 -> 256 ch, 2x2x2)
-    - up_blocks.4: 5 res blocks (256 ch) + timestep conditioning
-    - up_blocks.5: depth-to-space upsample (256 -> 128 ch, 2x2x2)
-    - up_blocks.6: 5 res blocks (128 ch) + timestep conditioning
-    - final norm + timestep conditioning
-    - conv_out: 128 -> 48 (for patch_size=4 unpatchify)
-
-    Total upsampling: 8x temporal, 8x spatial from d2s + 4x spatial from unpatchify = 32x spatial
+    Architecture is determined by decoder_blocks config from checkpoint metadata.
+    Blocks are built in reverse order (latent → output), matching PyTorch.
     """
 
-    def __init__(self, compute_dtype: mx.Dtype = mx.float32):
+    def __init__(
+        self,
+        decoder_blocks: Optional[List] = None,
+        base_channels: int = 128,
+        timestep_conditioning: bool = True,
+        compute_dtype: mx.Dtype = mx.float32,
+    ):
         super().__init__()
         self.compute_dtype = compute_dtype
+        self.timestep_conditioning = timestep_conditioning
+
+        if decoder_blocks is None:
+            decoder_blocks = _DEFAULT_DECODER_BLOCKS
 
         # Per-channel statistics for denormalization
-        # Note: kept as float32 for numerical stability
         self.mean_of_means = mx.zeros((128,), dtype=mx.float32)
         self.std_of_means = mx.zeros((128,), dtype=mx.float32)
 
-        # Timestep conditioning
-        self.timestep_scale_multiplier = mx.array(1000.0)
-
-        # Noise injection scale (matches PyTorch VAE decoder behavior)
-        # When timestep conditioning is enabled, noise is mixed with the latent
+        # Noise injection scale
         self.decode_noise_scale = 0.025
 
-        # Conv in: 128 -> 1024
-        self.conv_in = Conv3dSimple(128, 1024)
+        # Feature channels start at base_channels * 8
+        feature_channels = base_channels * 8
 
-        # Up blocks
-        # Factor (2,2,2) = 8x channel reduction (also halves channels) + 2x upsample in T,H,W
-        # 1024 -> conv(4096) -> d2s -> 512 ch, 2x spatial/temporal
-        self.up_blocks_0 = ResBlockGroup(1024, num_blocks=5)
-        self.up_blocks_1 = DepthToSpaceUpsample3d(1024, factor=(2, 2, 2), residual=True)  # -> 512 ch
-        self.up_blocks_2 = ResBlockGroup(512, num_blocks=5)
-        self.up_blocks_3 = DepthToSpaceUpsample3d(512, factor=(2, 2, 2), residual=True)   # -> 256 ch
-        self.up_blocks_4 = ResBlockGroup(256, num_blocks=5)
-        self.up_blocks_5 = DepthToSpaceUpsample3d(256, factor=(2, 2, 2), residual=True)   # -> 128 ch
-        self.up_blocks_6 = ResBlockGroup(128, num_blocks=5)
+        # Conv in: latent_channels -> feature_channels
+        self.conv_in = Conv3dSimple(128, feature_channels)
 
-        # Conv out: 128 -> 48 (3 * 16 for patch_size=4 unpatchify)
-        self.conv_out = Conv3dSimple(128, 48)
+        # Build up_blocks from reversed config (PyTorch reverses decoder_blocks)
+        self.up_blocks = []
+        self.block_types = []  # Track type for forward pass dispatch
+
+        for block_name, block_params in reversed(decoder_blocks):
+            block_config = {"num_layers": block_params} if isinstance(block_params, int) else block_params
+
+            if block_name == "res_x":
+                num_layers = block_config["num_layers"]
+                block = ResBlockGroup(feature_channels, num_blocks=num_layers)
+                self.up_blocks.append(block)
+                self.block_types.append("res")
+
+            elif block_name in _STRIDE_MAP:
+                stride = _STRIDE_MAP[block_name]
+                multiplier = block_config.get("multiplier", 1)
+                residual = block_config.get("residual", False)
+                block = DepthToSpaceUpsample3d(
+                    in_channels=feature_channels,
+                    stride=stride,
+                    residual=residual,
+                    out_channels_reduction_factor=multiplier,
+                )
+                feature_channels = feature_channels // multiplier
+                self.up_blocks.append(block)
+                self.block_types.append("upsample")
+
+            else:
+                raise ValueError(f"Unknown decoder block: {block_name}")
+
+        # Final output channel count (should be base_channels after all reductions)
+        self.final_channels = feature_channels
+
+        # Conv out: final_channels -> 48 (3 * patch_size^2 for unpatchify)
+        self.conv_out = Conv3dSimple(feature_channels, 48)
 
         # Scale/shift for final norm
-        # Note: kept as float32 for numerical stability
-        self.last_scale_shift_table = mx.zeros((2, 128), dtype=mx.float32)
-        # Time embedder for final norm (outputs 2*128=256 for scale+shift)
-        self.last_time_embedder = None  # Will be set during weight loading
+        self.last_scale_shift_table = mx.zeros((2, feature_channels), dtype=mx.float32)
+
+        # Timestep conditioning (only for V2.0-style decoders)
+        if timestep_conditioning:
+            self.timestep_scale_multiplier = mx.array(1000.0)
+            self.last_time_embedder = None  # Created during weight loading
+        else:
+            self.timestep_scale_multiplier = None
+            self.last_time_embedder = None
 
     def __call__(
         self,
@@ -454,11 +455,9 @@ class SimpleVideoDecoder(nn.Module):
 
         Args:
             latent: Latent tensor (B, 128, T, H, W).
-            timestep: Timestep for conditioning (default 0.05 for denoising).
-                      Use 0.0 for no denoising, None to disable timestep conditioning.
+            timestep: Timestep for conditioning (default 0.05).
             show_progress: Whether to show progress bar.
-            causal: Whether to use causal (past-only) temporal convolutions.
-                    Default False matches PyTorch VAE behavior.
+            causal: Whether to use causal temporal convolutions.
 
         Returns:
             Video tensor (B, 3, T*8, H*32, W*32).
@@ -479,38 +478,22 @@ class SimpleVideoDecoder(nn.Module):
 
         # Compute scaled timestep
         scaled_timestep = None
-        if timestep is not None:
+        if self.timestep_conditioning and timestep is not None and self.timestep_scale_multiplier is not None:
             t = mx.array([timestep] * batch_size)
             scaled_timestep = t * self.timestep_scale_multiplier
 
-        def step_res(x, block, desc):
-            nonlocal pbar
-            x = block(x, causal=causal, timestep=scaled_timestep)
-            mx.eval(x)
-            if has_tqdm and pbar is not None:
-                pbar.update(1)
-                pbar.set_description(desc)
-            return x
-
-        def step_up(x, block, desc):
-            nonlocal pbar
-            x = block(x, causal=causal)
-            mx.eval(x)
-            if has_tqdm and pbar is not None:
-                pbar.update(1)
-                pbar.set_description(desc)
-            return x
+        num_blocks = len(self.up_blocks)
+        total_steps = num_blocks + 3  # +3 for conv_in, conv_out, unpatchify
 
         if has_tqdm:
-            pbar = tqdm(total=10, desc="VAE decode", ncols=80)
+            pbar = tqdm(total=total_steps, desc="VAE decode", ncols=80)
 
         # Denormalize latent using per-channel statistics
         x = latent * self.std_of_means[None, :, None, None, None]
         x = x + self.mean_of_means[None, :, None, None, None]
 
-        # Noise injection when timestep conditioning is enabled (matches PyTorch)
-        # This helps the decoder handle residual noise in the latent space
-        if timestep is not None:
+        # Noise injection when timestep conditioning is enabled
+        if self.timestep_conditioning and timestep is not None:
             noise = mx.random.normal(x.shape) * self.decode_noise_scale
             x = noise + (1.0 - self.decode_noise_scale) * x
 
@@ -521,33 +504,37 @@ class SimpleVideoDecoder(nn.Module):
             pbar.update(1)
             pbar.set_description("conv_in done")
 
-        # Up blocks with progress and timestep conditioning
-        x = step_res(x, self.up_blocks_0, "res_blocks 1/4")
-        x = step_up(x, self.up_blocks_1, "upsample 1/3")
-        x = step_res(x, self.up_blocks_2, "res_blocks 2/4")
-        x = step_up(x, self.up_blocks_3, "upsample 2/3")
-        x = step_res(x, self.up_blocks_4, "res_blocks 3/4")
-        x = step_up(x, self.up_blocks_5, "upsample 3/3")
-        x = step_res(x, self.up_blocks_6, "res_blocks 4/4")
+        # Up blocks
+        res_count = 0
+        up_count = 0
+        total_res = sum(1 for bt in self.block_types if bt == "res")
+        total_up = sum(1 for bt in self.block_types if bt == "upsample")
+
+        for i, (block, btype) in enumerate(zip(self.up_blocks, self.block_types)):
+            if btype == "res":
+                res_count += 1
+                x = block(x, causal=causal, timestep=scaled_timestep)
+                desc = f"res_blocks {res_count}/{total_res}"
+            else:
+                up_count += 1
+                x = block(x, causal=causal)
+                desc = f"upsample {up_count}/{total_up}"
+            mx.eval(x)
+            if has_tqdm and pbar is not None:
+                pbar.update(1)
+                pbar.set_description(desc)
 
         # Final norm and activation with optional timestep conditioning
         x = _pixel_norm(x)
 
-        # Get scale/shift, optionally adding timestep embedding
-        # LTX ordering: (shift, scale) = unbind(dim=1), so row 0 is shift, row 1 is scale
         if scaled_timestep is not None and self.last_time_embedder is not None:
-            # Get sinusoidal embedding
-            t_emb = get_timestep_embedding(scaled_timestep, 256)  # (B, 256)
-            # Project through time embedder
-            time_emb = self.last_time_embedder(t_emb)  # (B, 256) = (B, 2*128)
-            time_emb = time_emb.reshape(batch_size, 2, 128)
-            # Add to table: (2, 128) + (B, 2, 128) -> (B, 2, 128)
+            t_emb = get_timestep_embedding(scaled_timestep, 256)
+            time_emb = self.last_time_embedder(t_emb)
+            time_emb = time_emb.reshape(batch_size, 2, self.final_channels)
             ss_table = self.last_scale_shift_table[None, :, :] + time_emb
-            # Row 0 = shift, Row 1 = scale (LTX ordering)
-            shift = ss_table[:, 0, :][:, :, None, None, None]  # (B, C, 1, 1, 1)
+            shift = ss_table[:, 0, :][:, :, None, None, None]
             scale = 1 + ss_table[:, 1, :][:, :, None, None, None]
         else:
-            # Without timestep: row 0 = shift, row 1 = scale
             shift = self.last_scale_shift_table[0][None, :, None, None, None]
             scale = 1 + self.last_scale_shift_table[1][None, :, None, None, None]
 
@@ -579,10 +566,7 @@ class SimpleVideoDecoder(nn.Module):
 def load_vae_decoder_weights(decoder: SimpleVideoDecoder, weights_path: str) -> None:
     """
     Load VAE decoder weights from PyTorch safetensors file.
-
-    Args:
-        decoder: SimpleVideoDecoder instance to load weights into.
-        weights_path: Path to safetensors file containing VAE weights.
+    Works generically for any decoder architecture built from config.
     """
     from safetensors import safe_open
     import torch
@@ -590,181 +574,101 @@ def load_vae_decoder_weights(decoder: SimpleVideoDecoder, weights_path: str) -> 
     print(f"Loading VAE decoder weights from {weights_path}...")
 
     loaded_count = 0
-    skipped_count = 0
 
     with safe_open(weights_path, framework="pt") as f:
-        # Load per-channel statistics
-        for stat_key in ["mean-of-means", "std-of-means"]:
-            pt_key = f"vae.per_channel_statistics.{stat_key}"
-            if pt_key in f.keys():
-                tensor = f.get_tensor(pt_key)
-                if tensor.dtype == torch.bfloat16:
-                    tensor = tensor.to(torch.float32)
-                value = mx.array(tensor.numpy())
+        all_keys = set(f.keys())
 
-                if stat_key == "mean-of-means":
-                    decoder.mean_of_means = value
-                else:
-                    decoder.std_of_means = value
-                loaded_count += 1
+        def load_tensor(pt_key):
+            nonlocal loaded_count
+            if pt_key not in all_keys:
+                return None
+            tensor = f.get_tensor(pt_key)
+            if tensor.dtype == torch.bfloat16:
+                tensor = tensor.to(torch.float32)
+            loaded_count += 1
+            return mx.array(tensor.numpy())
+
+        # Load per-channel statistics
+        for stat_key, attr_name in [("mean-of-means", "mean_of_means"), ("std-of-means", "std_of_means")]:
+            val = load_tensor(f"vae.per_channel_statistics.{stat_key}")
+            if val is not None:
+                setattr(decoder, attr_name, val)
 
         # Load conv_in
         for suffix in ["weight", "bias"]:
-            pt_key = f"vae.decoder.conv_in.conv.{suffix}"
-            if pt_key in f.keys():
-                tensor = f.get_tensor(pt_key)
-                if tensor.dtype == torch.bfloat16:
-                    tensor = tensor.to(torch.float32)
-                value = mx.array(tensor.numpy())
+            val = load_tensor(f"vae.decoder.conv_in.conv.{suffix}")
+            if val is not None:
+                setattr(decoder.conv_in, suffix, val)
 
-                if suffix == "weight":
-                    decoder.conv_in.weight = value
-                else:
-                    decoder.conv_in.bias = value
-                loaded_count += 1
-
-        # Load up_blocks
-        block_mapping = [
-            (0, "up_blocks_0", "res"),
-            (1, "up_blocks_1", "upsample"),
-            (2, "up_blocks_2", "res"),
-            (3, "up_blocks_3", "upsample"),
-            (4, "up_blocks_4", "res"),
-            (5, "up_blocks_5", "upsample"),
-            (6, "up_blocks_6", "res"),
-        ]
-
-        for pt_idx, mlx_name, block_type in block_mapping:
-            block = getattr(decoder, mlx_name)
-
-            if block_type == "res":
+        # Load up_blocks generically
+        for pt_idx, (block, btype) in enumerate(zip(decoder.up_blocks, decoder.block_types)):
+            if btype == "res":
                 # Load res blocks
-                for res_idx in range(5):
-                    res_block = block.res_blocks[res_idx]
-
-                    # Load conv1 and conv2
+                for res_idx, res_block in enumerate(block.res_blocks):
                     for conv_name in ["conv1", "conv2"]:
                         conv = getattr(res_block, conv_name)
                         for suffix in ["weight", "bias"]:
-                            pt_key = f"vae.decoder.up_blocks.{pt_idx}.res_blocks.{res_idx}.{conv_name}.conv.{suffix}"
-                            if pt_key in f.keys():
-                                tensor = f.get_tensor(pt_key)
-                                if tensor.dtype == torch.bfloat16:
-                                    tensor = tensor.to(torch.float32)
-                                value = mx.array(tensor.numpy())
-
-                                if suffix == "weight":
-                                    conv.weight = value
-                                else:
-                                    conv.bias = value
-                                loaded_count += 1
+                            val = load_tensor(f"vae.decoder.up_blocks.{pt_idx}.res_blocks.{res_idx}.{conv_name}.conv.{suffix}")
+                            if val is not None:
+                                setattr(conv, suffix, val)
 
                     # Load scale_shift_table
-                    pt_key = f"vae.decoder.up_blocks.{pt_idx}.res_blocks.{res_idx}.scale_shift_table"
-                    if pt_key in f.keys():
-                        tensor = f.get_tensor(pt_key)
-                        if tensor.dtype == torch.bfloat16:
-                            tensor = tensor.to(torch.float32)
-                        res_block.scale_shift_table = mx.array(tensor.numpy())
-                        loaded_count += 1
+                    val = load_tensor(f"vae.decoder.up_blocks.{pt_idx}.res_blocks.{res_idx}.scale_shift_table")
+                    if val is not None:
+                        res_block.scale_shift_table = val
+
+                # Load time embedder for this res block group
+                pt_prefix = f"vae.decoder.up_blocks.{pt_idx}.time_embedder.timestep_embedder"
+                l1_key = f"{pt_prefix}.linear_1.weight"
+                if l1_key in all_keys:
+                    l1_weight = f.get_tensor(l1_key)
+                    hidden_dim = l1_weight.shape[0]
+                    output_dim = 4 * block.channels
+
+                    block.time_embedder = TimestepEmbedder(
+                        hidden_dim=hidden_dim, output_dim=output_dim, input_dim=256
+                    )
+                    for layer_name in ["linear_1", "linear_2"]:
+                        for suffix in ["weight", "bias"]:
+                            val = load_tensor(f"{pt_prefix}.{layer_name}.{suffix}")
+                            if val is not None:
+                                layer = getattr(block.time_embedder, layer_name)
+                                setattr(layer, suffix, val)
 
             else:  # upsample
-                # Load upsample conv
                 for suffix in ["weight", "bias"]:
-                    pt_key = f"vae.decoder.up_blocks.{pt_idx}.conv.conv.{suffix}"
-                    if pt_key in f.keys():
-                        tensor = f.get_tensor(pt_key)
-                        if tensor.dtype == torch.bfloat16:
-                            tensor = tensor.to(torch.float32)
-                        value = mx.array(tensor.numpy())
-
-                        if suffix == "weight":
-                            block.conv.weight = value
-                        else:
-                            block.conv.bias = value
-                        loaded_count += 1
+                    val = load_tensor(f"vae.decoder.up_blocks.{pt_idx}.conv.conv.{suffix}")
+                    if val is not None:
+                        setattr(block.conv, suffix, val)
 
         # Load conv_out
         for suffix in ["weight", "bias"]:
-            pt_key = f"vae.decoder.conv_out.conv.{suffix}"
-            if pt_key in f.keys():
-                tensor = f.get_tensor(pt_key)
-                if tensor.dtype == torch.bfloat16:
-                    tensor = tensor.to(torch.float32)
-                value = mx.array(tensor.numpy())
-
-                if suffix == "weight":
-                    decoder.conv_out.weight = value
-                else:
-                    decoder.conv_out.bias = value
-                loaded_count += 1
+            val = load_tensor(f"vae.decoder.conv_out.conv.{suffix}")
+            if val is not None:
+                setattr(decoder.conv_out, suffix, val)
 
         # Load last_scale_shift_table
-        pt_key = "vae.decoder.last_scale_shift_table"
-        if pt_key in f.keys():
-            tensor = f.get_tensor(pt_key)
-            if tensor.dtype == torch.bfloat16:
-                tensor = tensor.to(torch.float32)
-            decoder.last_scale_shift_table = mx.array(tensor.numpy())
-            loaded_count += 1
+        val = load_tensor("vae.decoder.last_scale_shift_table")
+        if val is not None:
+            decoder.last_scale_shift_table = val
 
-        # Load timestep_scale_multiplier
-        pt_key = "vae.decoder.timestep_scale_multiplier"
-        if pt_key in f.keys():
-            tensor = f.get_tensor(pt_key)
-            if tensor.dtype == torch.bfloat16:
-                tensor = tensor.to(torch.float32)
-            decoder.timestep_scale_multiplier = mx.array(tensor.numpy())
-            loaded_count += 1
+        # Load timestep conditioning params
+        if decoder.timestep_conditioning:
+            val = load_tensor("vae.decoder.timestep_scale_multiplier")
+            if val is not None:
+                decoder.timestep_scale_multiplier = val
 
-        # Load last_time_embedder
-        pt_prefix = "vae.decoder.last_time_embedder.timestep_embedder"
-        if f"{pt_prefix}.linear_1.weight" in f.keys():
-            # Create the embedder: 256 -> 256 -> 256 (output is 2*128=256 for scale+shift)
-            decoder.last_time_embedder = TimestepEmbedder(
-                hidden_dim=256, output_dim=256, input_dim=256
-            )
-            for layer_name in ["linear_1", "linear_2"]:
-                for suffix in ["weight", "bias"]:
-                    pt_key = f"{pt_prefix}.{layer_name}.{suffix}"
-                    if pt_key in f.keys():
-                        tensor = f.get_tensor(pt_key)
-                        if tensor.dtype == torch.bfloat16:
-                            tensor = tensor.to(torch.float32)
-                        value = mx.array(tensor.numpy())
-                        layer = getattr(decoder.last_time_embedder, layer_name)
-                        setattr(layer, suffix, value)
-                        loaded_count += 1
-
-        # Load time embedders for res blocks (up_blocks 0, 2, 4, 6)
-        res_block_channels = {0: 1024, 2: 512, 4: 256, 6: 128}
-        for pt_idx, channels in res_block_channels.items():
-            mlx_name = f"up_blocks_{pt_idx}"
-            block = getattr(decoder, mlx_name)
-            pt_prefix = f"vae.decoder.up_blocks.{pt_idx}.time_embedder.timestep_embedder"
-
-            if f"{pt_prefix}.linear_1.weight" in f.keys():
-                # Create the embedder: 256 -> hidden -> 4*channels (for scale/shift of 2 norms)
-                # Output dim is 4*channels because each res block has 2 norms with scale+shift
-                output_dim = 4 * channels
-                # Hidden dim from weight shape
-                l1_weight = f.get_tensor(f"{pt_prefix}.linear_1.weight")
-                hidden_dim = l1_weight.shape[0]
-
-                block.time_embedder = TimestepEmbedder(
-                    hidden_dim=hidden_dim, output_dim=output_dim, input_dim=256
+            pt_prefix = "vae.decoder.last_time_embedder.timestep_embedder"
+            if f"{pt_prefix}.linear_1.weight" in all_keys:
+                decoder.last_time_embedder = TimestepEmbedder(
+                    hidden_dim=256, output_dim=2 * decoder.final_channels, input_dim=256
                 )
                 for layer_name in ["linear_1", "linear_2"]:
                     for suffix in ["weight", "bias"]:
-                        pt_key = f"{pt_prefix}.{layer_name}.{suffix}"
-                        if pt_key in f.keys():
-                            tensor = f.get_tensor(pt_key)
-                            if tensor.dtype == torch.bfloat16:
-                                tensor = tensor.to(torch.float32)
-                            value = mx.array(tensor.numpy())
-                            layer = getattr(block.time_embedder, layer_name)
-                            setattr(layer, suffix, value)
-                            loaded_count += 1
+                        val = load_tensor(f"{pt_prefix}.{layer_name}.{suffix}")
+                        if val is not None:
+                            layer = getattr(decoder.last_time_embedder, layer_name)
+                            setattr(layer, suffix, val)
 
     print(f"  Loaded {loaded_count} weight tensors")
 
@@ -791,9 +695,6 @@ def decode_latent(
     # Add batch dim if needed
     if latent.ndim == 4:
         latent = latent[None]
-
-    # Note: Un-normalization is handled internally by SimpleVideoDecoder.__call__()
-    # at lines 476-477, so we pass the normalized latent directly.
 
     # Decode with timestep conditioning
     video = decoder(latent, timestep=timestep)

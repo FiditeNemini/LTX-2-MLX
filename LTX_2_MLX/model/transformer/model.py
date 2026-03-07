@@ -66,6 +66,7 @@ class Modality:
     timesteps: mx.array  # Shape: (B,) or (B, T) - timestep values
     positions: mx.array  # Shape: (B, n_dims, T) - position indices
     enabled: bool = True
+    sigma: Optional[mx.array] = None  # Shape: (B,) - scalar noise level for V2 prompt_adaln
 
 
 class TransformerArgsPreprocessor:
@@ -83,7 +84,7 @@ class TransformerArgsPreprocessor:
         self,
         patchify_proj: nn.Linear,
         adaln: AdaLayerNormSingle,
-        caption_projection: PixArtAlphaTextProjection,
+        caption_projection: Optional[PixArtAlphaTextProjection],
         inner_dim: int,
         max_pos: List[int],
         num_attention_heads: int,
@@ -92,6 +93,7 @@ class TransformerArgsPreprocessor:
         positional_embedding_theta: float = 10000.0,
         rope_type: LTXRopeType = LTXRopeType.SPLIT,  # LTX-2 distilled uses SPLIT
         compute_dtype: mx.Dtype = mx.float32,
+        prompt_adaln: Optional[AdaLayerNormSingle] = None,
     ):
         self.patchify_proj = patchify_proj
         self.adaln = adaln
@@ -104,10 +106,12 @@ class TransformerArgsPreprocessor:
         self.positional_embedding_theta = positional_embedding_theta
         self.rope_type = rope_type
         self.compute_dtype = compute_dtype
+        self.prompt_adaln = prompt_adaln
 
     def _prepare_timestep(
         self,
         timestep: mx.array,
+        adaln: AdaLayerNormSingle,
         batch_size: int,
     ) -> Tuple[mx.array, mx.array]:
         """
@@ -115,22 +119,20 @@ class TransformerArgsPreprocessor:
 
         Args:
             timestep: Timestep values, shape (B,) or (B, T).
+            adaln: AdaLayerNormSingle to use.
             batch_size: Batch size.
 
         Returns:
             Tuple of (timestep_emb, embedded_timestep).
         """
         timestep = timestep * self.timestep_scale_multiplier
-        # AdaLayerNormSingle now returns tuple of (processed_emb, raw_embedded_timestep)
-        emb, embedded_timestep = self.adaln(timestep.flatten())
+        emb, embedded_timestep = adaln(timestep.flatten())
 
         # Reshape processed emb to (B, num_tokens, num_embeddings, inner_dim)
-        # The processed emb has shape (B, num_embeddings * inner_dim)
-        num_embeddings = 6  # scale, shift, gate for self-attn and ffn
+        num_embeddings = emb.shape[-1] // self.inner_dim
         emb = emb.reshape(batch_size, -1, num_embeddings, self.inner_dim)
 
         # Reshape raw embedded_timestep to (B, num_tokens, inner_dim)
-        # This is the pre-linear embedding used for final output modulation
         embedded_timestep = embedded_timestep.reshape(batch_size, -1, self.inner_dim)
 
         return emb, embedded_timestep
@@ -151,7 +153,8 @@ class TransformerArgsPreprocessor:
             Projected context, shape (B, S, inner_dim).
         """
         batch_size = x.shape[0]
-        context = self.caption_projection(context)
+        if self.caption_projection is not None:
+            context = self.caption_projection(context)
         context = context.reshape(batch_size, -1, x.shape[-1])
         return context
 
@@ -239,8 +242,20 @@ class TransformerArgsPreprocessor:
 
         # Prepare timestep embeddings
         timestep_emb, embedded_timestep = self._prepare_timestep(
-            modality.timesteps, batch_size
+            modality.timesteps, self.adaln, batch_size
         )
+
+        # Prepare prompt timestep (V2 cross-attention adaln)
+        prompt_timestep = None
+        if self.prompt_adaln is not None:
+            # Use sigma if provided, otherwise fall back to timesteps (same for scalar case)
+            sigma = modality.sigma if modality.sigma is not None else modality.timesteps
+            if sigma.ndim > 1:
+                sigma = sigma[:, 0]  # Per-token timesteps: use first token's sigma
+            prompt_emb, _ = self._prepare_timestep(
+                sigma, self.prompt_adaln, batch_size
+            )
+            prompt_timestep = prompt_emb  # Shape: (B, 1, 2, D)
 
         # Prepare context (caption projection)
         context = self._prepare_context(modality.context, x)
@@ -260,6 +275,7 @@ class TransformerArgsPreprocessor:
             positional_embeddings=pe,
             context_mask=attention_mask,
             embedded_timestep=embedded_timestep,
+            prompt_timestep=prompt_timestep,
         )
 
 
@@ -409,7 +425,7 @@ class LTXModel(nn.Module):
         num_layers: int = 48,
         cross_attention_dim: int = 4096,
         norm_eps: float = 1e-6,
-        caption_channels: int = 3840,
+        caption_channels: Optional[int] = 3840,
         positional_embedding_theta: float = 10000.0,
         positional_embedding_max_pos: Optional[List[int]] = None,
         timestep_scale_multiplier: int = 1000,
@@ -422,6 +438,8 @@ class LTXModel(nn.Module):
         compute_dtype: mx.Dtype = mx.float32,
         low_memory: bool = False,
         fast_mode: bool = False,
+        cross_attention_adaln: bool = False,
+        apply_gated_attention: bool = False,
     ):
         """
         Initialize LTX model.
@@ -458,6 +476,7 @@ class LTXModel(nn.Module):
         self.compute_dtype = compute_dtype
         self.low_memory = low_memory
         self.fast_mode = fast_mode
+        self.cross_attention_adaln = cross_attention_adaln
         
         # Eval frequency setup
         if fast_mode:
@@ -481,6 +500,9 @@ class LTXModel(nn.Module):
         # Audio dimensions
         self.audio_inner_dim = self.AUDIO_ATTENTION_HEADS * self.AUDIO_HEAD_DIM
 
+        # V2: 9 adaln params (6 base + 3 for cross-attention Q modulation)
+        adaln_num_embeddings = 9 if cross_attention_adaln else 6
+
         # =================
         # VIDEO COMPONENTS
         # =================
@@ -489,13 +511,24 @@ class LTXModel(nn.Module):
             self.patchify_proj = nn.Linear(in_channels, self.video_inner_dim, bias=True)
 
             # AdaLN
-            self.adaln_single = AdaLayerNormSingle(self.video_inner_dim)
-
-            # Caption projection
-            self.caption_projection = PixArtAlphaTextProjection(
-                in_features=caption_channels,
-                hidden_size=self.video_inner_dim,
+            self.adaln_single = AdaLayerNormSingle(
+                self.video_inner_dim, num_embeddings=adaln_num_embeddings
             )
+
+            # V2: prompt adaln for cross-attention KV modulation
+            self.prompt_adaln_single = (
+                AdaLayerNormSingle(self.video_inner_dim, num_embeddings=2)
+                if cross_attention_adaln else None
+            )
+
+            # Caption projection (None for V2 models where feature extractor projects directly)
+            if caption_channels is not None:
+                self.caption_projection = PixArtAlphaTextProjection(
+                    in_features=caption_channels,
+                    hidden_size=self.video_inner_dim,
+                )
+            else:
+                self.caption_projection = None
 
             # Output projection
             self.scale_shift_table = mx.zeros((2, self.video_inner_dim), dtype=mx.float32)
@@ -512,13 +545,24 @@ class LTXModel(nn.Module):
             )
 
             # AdaLN
-            self.audio_adaln_single = AdaLayerNormSingle(self.audio_inner_dim)
-
-            # Caption projection
-            self.audio_caption_projection = PixArtAlphaTextProjection(
-                in_features=caption_channels,
-                hidden_size=self.audio_inner_dim,
+            self.audio_adaln_single = AdaLayerNormSingle(
+                self.audio_inner_dim, num_embeddings=adaln_num_embeddings
             )
+
+            # V2: prompt adaln for audio cross-attention KV modulation
+            self.audio_prompt_adaln_single = (
+                AdaLayerNormSingle(self.audio_inner_dim, num_embeddings=2)
+                if cross_attention_adaln else None
+            )
+
+            # Caption projection (None for V2 models where feature extractor projects directly)
+            if caption_channels is not None:
+                self.audio_caption_projection = PixArtAlphaTextProjection(
+                    in_features=caption_channels,
+                    hidden_size=self.audio_inner_dim,
+                )
+            else:
+                self.audio_caption_projection = None
 
             # Output projection
             self.audio_scale_shift_table = mx.zeros((2, self.audio_inner_dim), dtype=mx.float32)
@@ -554,8 +598,10 @@ class LTXModel(nn.Module):
                 heads=num_attention_heads,
                 d_head=attention_head_dim,
                 context_dim=cross_attention_dim,
+                cross_attention_adaln=cross_attention_adaln,
+                apply_gated_attention=apply_gated_attention,
             )
-            
+
         audio_config = None
         if self.model_type.is_audio_enabled():
             audio_config = TransformerConfig(
@@ -563,6 +609,8 @@ class LTXModel(nn.Module):
                 heads=self.AUDIO_ATTENTION_HEADS,
                 d_head=self.AUDIO_HEAD_DIM,
                 context_dim=cross_attention_dim,
+                cross_attention_adaln=cross_attention_adaln,
+                apply_gated_attention=apply_gated_attention,
             )
 
         self.transformer_blocks = [
@@ -592,6 +640,7 @@ class LTXModel(nn.Module):
                 positional_embedding_theta=self.positional_embedding_theta,
                 rope_type=self.rope_type,
                 compute_dtype=self.compute_dtype,
+                prompt_adaln=self.prompt_adaln_single,
             )
             if self.model_type.is_audio_enabled():
                 self._video_args_preprocessor = MultiModalTransformerArgsPreprocessor(
@@ -618,6 +667,7 @@ class LTXModel(nn.Module):
                 positional_embedding_theta=self.positional_embedding_theta,
                 rope_type=self.rope_type,
                 compute_dtype=self.compute_dtype,
+                prompt_adaln=self.audio_prompt_adaln_single,
             )
             if self.model_type.is_video_enabled():
                 self._audio_args_preprocessor = MultiModalTransformerArgsPreprocessor(
@@ -712,6 +762,7 @@ class LTXModel(nn.Module):
                     timesteps=video.timesteps,
                     positions=video.positions,
                     enabled=video.enabled,
+                    sigma=video.sigma,
                 )
             if audio is not None:
                 audio = Modality(
@@ -721,6 +772,7 @@ class LTXModel(nn.Module):
                     timesteps=audio.timesteps,
                     positions=audio.positions,
                     enabled=audio.enabled,
+                    sigma=audio.sigma,
                 )
 
         # --- Preprocessing ---
@@ -733,7 +785,16 @@ class LTXModel(nn.Module):
         audio_args = None
         if self.model_type.is_audio_enabled():
             if audio is None:
-                raise ValueError("Audio modality required for audio-enabled model")
+                # Create empty audio modality (video-only inference on AV model)
+                batch_size = video_args.x.shape[0] if video_args else 1
+                audio = Modality(
+                    latent=mx.zeros((batch_size, 0, self.audio_inner_dim)),
+                    context=mx.zeros((batch_size, 0, self.audio_inner_dim)),
+                    context_mask=None,
+                    timesteps=mx.zeros((batch_size,)),
+                    positions=mx.zeros((batch_size, 3, 0)),
+                    enabled=False,
+                )
             # Only preprocess if has tokens
             if audio.latent.size > 0:
                 audio_args = self._audio_args_preprocessor.prepare(audio)
@@ -818,7 +879,11 @@ class X0Model(nn.Module):
             # AudioVideo case
             video_vel, audio_vel = output
             denoised_video = denoise(video, video_vel)
-            denoised_audio = denoise(audio, audio_vel)
+            if audio is not None:
+                denoised_audio = denoise(audio, audio_vel)
+            else:
+                # Video-only inference on AV model — return video only
+                return denoised_video
             return denoised_video, denoised_audio
         else:
             # VideoOnly or AudioOnly case

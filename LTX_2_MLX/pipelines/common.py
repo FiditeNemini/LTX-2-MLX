@@ -207,6 +207,7 @@ def modality_from_state(
         positions=state.positions,
         context=context,
         context_mask=None,
+        sigma=mx.array([sigma]),
     )
 
 
@@ -236,4 +237,5 @@ def audio_modality_from_state(
         positions=state.positions,
         context=context,
         context_mask=None,
+        sigma=mx.array([sigma]),
     )

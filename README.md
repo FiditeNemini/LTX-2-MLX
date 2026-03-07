@@ -4,7 +4,7 @@
 [![Original Repo](https://img.shields.io/badge/GitHub-LTX--2-181717?logo=github)](https://github.com/Lightricks/LTX-2)
 [![Paper](https://img.shields.io/badge/Paper-PDF-EC1C24?logo=adobeacrobatreader&logoColor=white)](https://arxiv.org/abs/2601.03233)
 
-Native Apple Silicon implementation of [Lightricks LTX-2](https://github.com/Lightricks/LTX-2), a 19B parameter video generation model, using [MLX](https://github.com/ml-explore/mlx).
+Native Apple Silicon implementation of [Lightricks LTX-2](https://github.com/Lightricks/LTX-2) video generation models using [MLX](https://github.com/ml-explore/mlx). Supports both **LTX-2.0** (19B) and **LTX-2.3** (22B) with automatic version detection.
 
 <table>
 <tr>
@@ -52,17 +52,29 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 # 2. Download weights
 uv run scripts/download_weights.py
 
-# 3. Generate video
+# 3. Generate video (auto-detects model version)
 uv run python scripts/generate.py "A golden retriever running through a meadow"
+
+# Or specify the 2.3 checkpoint explicitly
+uv run python scripts/generate.py --weights weights/ltx-2.3/ltx-2.3-22b-distilled.safetensors \
+  "A golden retriever running through a meadow"
 ```
 
 ## Required Models
+
+### LTX-2.3 (Recommended)
 
 Download from [Lightricks/LTX-2](https://huggingface.co/Lightricks/LTX-2) on HuggingFace:
 
 | Model | Size | Description |
 |-------|------|-------------|
-| [`ltx-2-19b-distilled.safetensors`](https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-distilled.safetensors) | 43GB | Fast generation (8 steps) - **Recommended** |
+| [`ltx-2.3-22b-distilled.safetensors`](https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2.3-22b-distilled.safetensors) | 46GB | **Latest** - 22B params, 8 steps |
+
+### LTX-2.0
+
+| Model | Size | Description |
+|-------|------|-------------|
+| [`ltx-2-19b-distilled.safetensors`](https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-distilled.safetensors) | 43GB | Fast generation (8 steps) |
 | [`ltx-2-19b-distilled-fp8.safetensors`](https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-distilled-fp8.safetensors) | 27GB | FP8 quantized (smaller download) |
 | [`ltx-2-19b-dev.safetensors`](https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-dev.safetensors) | 43GB | Higher quality (25-50 steps) |
 | [`ltx-2-spatial-upscaler-x2-1.0.safetensors`](https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-spatial-upscaler-x2-1.0.safetensors) | 995MB | 2x resolution upscaling |

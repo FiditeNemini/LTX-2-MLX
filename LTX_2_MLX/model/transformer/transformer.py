@@ -54,6 +54,8 @@ class TransformerConfig:
     heads: int
     d_head: int
     context_dim: int
+    cross_attention_adaln: bool = False
+    apply_gated_attention: bool = False
 
 
 @dataclass
@@ -71,6 +73,8 @@ class TransformerArgs:
     cross_scale_shift_timestep: Optional[mx.array] = None  # AdaLN for cross-attention scale/shift
     cross_gate_timestep: Optional[mx.array] = None  # AdaLN for cross-attention gate
     enabled: bool = True  # Whether this modality is enabled
+    # V2 cross-attention AdaLN: prompt_timestep for KV modulation
+    prompt_timestep: Optional[mx.array] = None  # Shape: (B, T, 2, D) from prompt_adaln_single
 
     def replace(self, **kwargs) -> "TransformerArgs":
         """Return a new TransformerArgs with specified fields replaced."""
@@ -85,6 +89,7 @@ class TransformerArgs:
             cross_scale_shift_timestep=kwargs.get("cross_scale_shift_timestep", self.cross_scale_shift_timestep),
             cross_gate_timestep=kwargs.get("cross_gate_timestep", self.cross_gate_timestep),
             enabled=kwargs.get("enabled", self.enabled),
+            prompt_timestep=kwargs.get("prompt_timestep", self.prompt_timestep),
         )
 
 
@@ -266,6 +271,15 @@ class BasicAVTransformerBlock(nn.Module):
         self.idx = idx
         self.norm_eps = norm_eps
 
+        self.cross_attention_adaln = (
+            (video_config is not None and video_config.cross_attention_adaln)
+            or (audio_config is not None and audio_config.cross_attention_adaln)
+        )
+
+        # V2: 9 adaln params (6 base + 3 cross-attn: shift_q, scale_q, gate)
+        # V1: 6 adaln params (shift, scale, gate for self-attn and ffn)
+        adaln_params = 9 if self.cross_attention_adaln else 6
+
         # Video components
         if video_config is not None:
             self.attn1 = Attention(
@@ -275,6 +289,7 @@ class BasicAVTransformerBlock(nn.Module):
                 context_dim=None,  # Self-attention
                 rope_type=rope_type,
                 norm_eps=norm_eps,
+                apply_gated_attention=video_config.apply_gated_attention,
             )
             self.attn2 = Attention(
                 query_dim=video_config.dim,
@@ -283,10 +298,10 @@ class BasicAVTransformerBlock(nn.Module):
                 dim_head=video_config.d_head,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
+                apply_gated_attention=video_config.apply_gated_attention,
             )
             self.ff = FeedForward(video_config.dim, dim_out=video_config.dim)
-            # Note: kept as float32 for numerical stability
-            self.scale_shift_table = mx.zeros((6, video_config.dim), dtype=mx.float32)
+            self.scale_shift_table = mx.zeros((adaln_params, video_config.dim), dtype=mx.float32)
 
         # Audio components
         if audio_config is not None:
@@ -297,6 +312,7 @@ class BasicAVTransformerBlock(nn.Module):
                 context_dim=None,  # Self-attention
                 rope_type=rope_type,
                 norm_eps=norm_eps,
+                apply_gated_attention=audio_config.apply_gated_attention,
             )
             self.audio_attn2 = Attention(
                 query_dim=audio_config.dim,
@@ -305,10 +321,16 @@ class BasicAVTransformerBlock(nn.Module):
                 dim_head=audio_config.d_head,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
+                apply_gated_attention=audio_config.apply_gated_attention,
             )
             self.audio_ff = FeedForward(audio_config.dim, dim_out=audio_config.dim)
-            # Note: kept as float32 for numerical stability
-            self.audio_scale_shift_table = mx.zeros((6, audio_config.dim), dtype=mx.float32)
+            self.audio_scale_shift_table = mx.zeros((adaln_params, audio_config.dim), dtype=mx.float32)
+
+        # V2 cross-attention adaln: per-block prompt scale/shift tables for KV modulation
+        if self.cross_attention_adaln and video_config is not None:
+            self.prompt_scale_shift_table = mx.zeros((2, video_config.dim), dtype=mx.float32)
+        if self.cross_attention_adaln and audio_config is not None:
+            self.audio_prompt_scale_shift_table = mx.zeros((2, audio_config.dim), dtype=mx.float32)
 
         # Cross-modal attention (audio ↔ video)
         if audio_config is not None and video_config is not None:
@@ -320,6 +342,7 @@ class BasicAVTransformerBlock(nn.Module):
                 dim_head=audio_config.d_head,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
+                apply_gated_attention=video_config.apply_gated_attention,
             )
 
             # Q: Audio, K,V: Video (video informs audio)
@@ -330,6 +353,7 @@ class BasicAVTransformerBlock(nn.Module):
                 dim_head=audio_config.d_head,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
+                apply_gated_attention=audio_config.apply_gated_attention,
             )
 
             # Cross-attention AdaLN tables
@@ -396,6 +420,36 @@ class BasicAVTransformerBlock(nn.Module):
 
         return (*scale_shift_values, *gate_values)
 
+    def _apply_text_cross_attention(
+        self,
+        x: mx.array,
+        context: mx.array,
+        attn: Attention,
+        scale_shift_table: mx.array,
+        prompt_scale_shift_table: Optional[mx.array],
+        timestep: mx.array,
+        prompt_timestep: Optional[mx.array],
+        context_mask: Optional[mx.array],
+    ) -> mx.array:
+        """Apply text cross-attention, with optional V2 AdaLN modulation."""
+        if self.cross_attention_adaln:
+            # V2: AdaLN on Q (from indices 6-8) and KV (from prompt tables)
+            shift_q, scale_q, gate = self.get_ada_values(
+                scale_shift_table, x.shape[0], timestep, 6, 9
+            )
+            # prompt_timestep: (B, T, 2, D), prompt_scale_shift_table: (2, D)
+            kv_modulation = (
+                prompt_scale_shift_table[None, None, :, :]
+                + prompt_timestep
+            )
+            shift_kv = kv_modulation[:, :, 0, :]
+            scale_kv = kv_modulation[:, :, 1, :]
+            attn_input = rms_norm(x, eps=self.norm_eps) * (1 + scale_q) + shift_q
+            encoder_hidden_states = context * (1 + scale_kv) + shift_kv
+            return attn(attn_input, context=encoder_hidden_states, mask=context_mask) * gate
+        # V1: simple RMSNorm on Q, no modulation
+        return attn(rms_norm(x, eps=self.norm_eps), context=context, mask=context_mask)
+
     def __call__(
         self,
         video: Optional[TransformerArgs],
@@ -456,11 +510,13 @@ class BasicAVTransformerBlock(nn.Module):
                 attn_out = self.attn1(norm_vx, pe=video.positional_embeddings)
                 vx = _compiled_residual_gate(vx, attn_out, gate_msa)
 
-            # Video cross-attention to text (no AdaLN, just RMSNorm)
-            cross_out = self.attn2(
-                rms_norm(vx, eps=self.norm_eps),
-                context=video.context,
-                mask=video.context_mask,
+            # Video cross-attention to text
+            cross_out = self._apply_text_cross_attention(
+                vx, video.context, self.attn2,
+                self.scale_shift_table,
+                getattr(self, "prompt_scale_shift_table", None),
+                video.timesteps, video.prompt_timestep,
+                video.context_mask,
             )
             vx = vx + cross_out
 
@@ -478,11 +534,13 @@ class BasicAVTransformerBlock(nn.Module):
                 attn_out = self.audio_attn1(norm_ax, pe=audio.positional_embeddings)
                 ax = _compiled_residual_gate(ax, attn_out, agate_msa)
 
-            # Audio cross-attention to text (no AdaLN, just RMSNorm)
-            cross_out = self.audio_attn2(
-                rms_norm(ax, eps=self.norm_eps),
-                context=audio.context,
-                mask=audio.context_mask,
+            # Audio cross-attention to text
+            cross_out = self._apply_text_cross_attention(
+                ax, audio.context, self.audio_attn2,
+                self.audio_scale_shift_table,
+                getattr(self, "audio_prompt_scale_shift_table", None),
+                audio.timesteps, audio.prompt_timestep,
+                audio.context_mask,
             )
             ax = ax + cross_out
 
